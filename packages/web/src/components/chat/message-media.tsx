@@ -1,0 +1,203 @@
+import { useState, useCallback, type CSSProperties } from 'react'
+import { isVideoMedia, type MediaAttachment } from '@/lib/conversations'
+import { FALLBACK_RATIO, declaredRatio, knownRatio, rememberRatio } from './media-dimensions'
+import { FileAttachment } from './file-attachment'
+import { VoiceMessage } from './voice-message'
+import { Skeleton } from '@/components/ui/skeleton'
+import { ImageLightbox } from '@/components/ui/image-lightbox'
+import { cn } from '@/lib/utils'
+import { VideoPlayer } from '@/components/ui/video-player'
+
+/**
+ * Thumbnail image with a shimmer skeleton while it loads/decodes, a cross-fade in
+ * on `onLoad`, and a graceful broken-image fallback on error (never an infinite
+ * skeleton). The skeleton and the broken-image tile both fill the reserved box, so
+ * whichever way the load ends the row keeps the height it started with.
+ *
+ * A grid tile is a fixed-height crop and needs no reservation. A single image is
+ * shown whole, so its slot is reserved at the ratio of the picture itself: the
+ * one the server measured off the bytes, else the one this tab measured on an
+ * earlier view, else the fallback until this load measures it.
+ */
+function LoadingImage({
+  src,
+  alt,
+  variant,
+  width,
+  height,
+}: {
+  src: string
+  alt: string
+  variant: 'single' | 'grid'
+  width?: number
+  height?: number
+}) {
+  const declared = declaredRatio(width, height)
+  const [status, setStatus] = useState<'loading' | 'loaded' | 'error'>('loading')
+  const [ratio, setRatio] = useState(() => declared ?? knownRatio(src) ?? FALLBACK_RATIO)
+  const isGrid = variant === 'grid'
+  const reserved = isGrid ? undefined : ({ '--media-ratio': String(ratio) } as CSSProperties)
+
+  if (status === 'error') {
+    return (
+      <div
+        role="img"
+        aria-label={`${alt} (failed to load)`}
+        style={reserved}
+        className={cn(
+          'flex items-center justify-center rounded-[var(--radius-lg)] bg-[var(--fill-secondary)] text-[var(--text-tertiary)]',
+          isGrid ? 'h-[130px] w-full' : 'aspect-[var(--media-ratio)] w-full',
+        )}
+      >
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+          <circle cx="9" cy="9" r="2" />
+          <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
+          <line x1="3" y1="3" x2="21" y2="21" />
+        </svg>
+      </div>
+    )
+  }
+
+  return (
+    <div
+      style={reserved}
+      className={cn('relative', !isGrid && 'aspect-[var(--media-ratio)]')}
+    >
+      <img
+        src={src}
+        alt={alt}
+        loading="lazy"
+        decoding="async"
+        onLoad={(event) => {
+          const { naturalWidth, naturalHeight } = event.currentTarget
+          rememberRatio(src, naturalWidth, naturalHeight)
+          // A declared pair already sized this box off the bytes themselves, so the
+          // cache is not consulted for it — reading one back here would let a stale
+          // or differently-oriented measurement move a box that is already right.
+          if (declared === null) {
+            const measured = knownRatio(src)
+            if (measured !== null) setRatio(measured)
+          }
+          setStatus('loaded')
+        }}
+        onError={() => setStatus('error')}
+        className={cn(
+          'block rounded-[var(--radius-lg)] transition-opacity duration-300',
+          isGrid ? 'h-[130px] w-full object-cover' : 'h-full w-full object-contain',
+          status === 'loaded' ? 'opacity-100' : 'opacity-0',
+        )}
+      />
+      {status === 'loading' && (
+        <Skeleton
+          data-testid="image-skeleton"
+          className="absolute inset-0 h-full w-full rounded-[var(--radius-lg)]"
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * Render a message's media. Images go in a responsive grid (single image stays
+ * large; multiples tile 2-up) and open a full-screen lightbox on click. Audio
+ * uses the voice player; every other type is a downloadable file chip.
+ * Handles single AND multiple attachments without clobbering.
+ */
+export function MessageMedia({ media, isUser }: { media: MediaAttachment[]; isUser: boolean }) {
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
+  const close = useCallback(() => setLightboxIndex(null), [])
+
+  const images = media.filter((m) => m.type === 'image')
+  const audio = media.filter((m) => m.type === 'audio')
+  const videos = media.filter(isVideoMedia)
+  const files = media.filter((m) => m.type !== 'image' && m.type !== 'audio' && !isVideoMedia(m))
+  const gallery = images.map((image, index) => ({
+    id: String(index),
+    url: image.url,
+    name: image.name || 'Image',
+  }))
+
+  return (
+    <>
+      {images.length > 0 && (
+        <div
+          className={
+            images.length > 1
+              ? 'mt-[var(--space-2)] grid grid-cols-2 gap-[var(--space-2)] w-full max-w-[var(--chat-media-multi,520px)]'
+              : // Declared, not a percentage: the bubble around this column shrinks to
+                // its contents, so `w-full` resolves against the text beside the picture
+                // and the reserved box comes out narrow — right ratio, wrong size — until
+                // the decode supplies an intrinsic width and the row widens under the
+                // reader. A declared width is the same before and after.
+                'mt-[var(--space-2)] w-[var(--chat-media-single,440px)] max-w-full'
+          }
+        >
+          {images.map((m, mi) => (
+            <button
+              key={`img-${mi}`}
+              type="button"
+              onClick={() => setLightboxIndex(mi)}
+              aria-label={`Open ${m.name || 'image'}`}
+              className={cn(
+                'block overflow-hidden rounded-[var(--radius-lg)] p-0 border-0 bg-transparent cursor-pointer',
+                // A button sizes to its contents even at `display: block`, and the
+                // reserved box inside is a percentage of the button — so left to
+                // itself the single image reserves a box of zero and jumps to full
+                // height on decode. Stretching to the column resolves the ratio
+                // against a real width. Grid tiles stretch to their track already.
+                images.length === 1 && 'w-full',
+              )}
+            >
+              <LoadingImage
+                src={m.url}
+                alt={m.name || 'Image'}
+                variant={images.length > 1 ? 'grid' : 'single'}
+                width={m.width}
+                height={m.height}
+              />
+            </button>
+          ))}
+        </div>
+      )}
+
+      {audio.map((m, mi) => (
+        <div key={`audio-${mi}`} className="mt-[var(--space-2)]">
+          <VoiceMessage src={m.url} duration={m.duration || 0} waveform={m.waveform || []} isUser={isUser} />
+        </div>
+      ))}
+
+      {videos.map((m, mi) => (
+        <div key={`video-${mi}`} className="mt-[var(--space-2)]">
+          <VideoPlayer src={m.url} name={m.name || 'Video'} />
+        </div>
+      ))}
+
+      {files.length > 0 && (
+        <div className="mt-[var(--space-2)] flex flex-col gap-[var(--space-2)]">
+          {files.map((m, mi) => (
+            <FileAttachment
+              key={`file-${mi}`}
+              name={m.name || 'File'}
+              size={m.size}
+              mimeType={m.mimeType}
+              url={m.url}
+              isUser={isUser}
+            />
+          ))}
+        </div>
+      )}
+
+      {lightboxIndex !== null && gallery[lightboxIndex] && (
+        <ImageLightbox
+          image={gallery[lightboxIndex]}
+          gallery={gallery}
+          onNavigate={(image) => setLightboxIndex(Number(image.id))}
+          onClose={close}
+          closeLabel="Close"
+          downloadLabel="Download image"
+        />
+      )}
+    </>
+  )
+}

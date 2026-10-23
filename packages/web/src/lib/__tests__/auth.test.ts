@@ -1,0 +1,135 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { authFetch, createPairingCode, getAuthState, listPairedDevices, logoutBrowser, pairBrowser, takeWorkspacePairingCode, unpairDevice } from "../auth"
+import { createBrowserGatewayTransport, installGatewayTransport } from "../gateway-transport"
+
+const GATEWAY_ORIGIN = "https://qa-a.example:7779"
+let restoreTransport: (() => void) | null = null
+
+function jsonResponse(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  })
+}
+
+describe("web auth helpers", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn())
+    restoreTransport = installGatewayTransport(createBrowserGatewayTransport({
+      origin: GATEWAY_ORIGIN,
+      request: (input, init) => fetch(input, init),
+      navigate: vi.fn(),
+    }))
+    localStorage.clear()
+    window.history.replaceState(null, "", "/")
+  })
+
+  afterEach(() => {
+    restoreTransport?.()
+    restoreTransport = null
+    vi.unstubAllGlobals()
+  })
+
+  it("uses a one-time UI launch grant to bootstrap local auth before retrying", async () => {
+    window.history.replaceState(null, "", "/#jinn-bootstrap=launch-grant")
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(401, { error: "Unauthorized" }))
+      .mockResolvedValueOnce(jsonResponse(200, {
+        authRequired: true,
+        authenticated: false,
+        canBootstrapLocal: true,
+        networkExposed: false,
+      }))
+      .mockResolvedValueOnce(jsonResponse(200, { status: "ok" }))
+      .mockResolvedValueOnce(jsonResponse(200, { ok: true }))
+
+    const res = await authFetch("/api/sessions")
+
+    expect(res.status).toBe(200)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(fetchMock.mock.calls.map((c) => String(c[0]))).toEqual([
+      `${GATEWAY_ORIGIN}/api/sessions`,
+      `${GATEWAY_ORIGIN}/api/auth/state`,
+      `${GATEWAY_ORIGIN}/api/auth/bootstrap`,
+      `${GATEWAY_ORIGIN}/api/sessions`,
+    ])
+    for (const [, init] of fetchMock.mock.calls) {
+      expect((init as RequestInit | undefined)?.credentials).toBe("include")
+    }
+    expect(localStorage.length).toBe(0)
+    expect(window.location.hash).toBe("")
+    expect((fetchMock.mock.calls[2][1] as RequestInit).headers).toMatchObject({
+      "X-Jinn-Bootstrap-Grant": "launch-grant",
+    })
+  })
+
+  it("does not bootstrap a local browser without a launch grant", async () => {
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(401, { error: "Unauthorized" }))
+      .mockResolvedValueOnce(jsonResponse(200, {
+        authRequired: true,
+        authenticated: false,
+        canBootstrapLocal: true,
+        networkExposed: false,
+      }))
+
+    const res = await authFetch("/api/sessions")
+
+    expect(res.status).toBe(401)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it("takes a one-time workspace pairing code from the fragment without disturbing onboarding", () => {
+    window.history.replaceState(null, "", "/?onboarding=1#jinn-pair=ABCD-EFGH-JKLM&view=chat")
+
+    expect(takeWorkspacePairingCode()).toBe("ABCD-EFGH-JKLM")
+    expect(window.location.pathname + window.location.search + window.location.hash).toBe("/?onboarding=1#view=chat")
+    expect(takeWorkspacePairingCode()).toBeUndefined()
+  })
+
+  it("does not retry remote auth failures without local bootstrap", async () => {
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(401, { error: "Unauthorized" }))
+      .mockResolvedValueOnce(jsonResponse(200, {
+        authRequired: true,
+        authenticated: false,
+        canBootstrapLocal: false,
+        networkExposed: true,
+      }))
+
+    const res = await authFetch("/api/logs")
+
+    expect(res.status).toBe(401)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it("wraps auth state, pairing, pairing-code creation, device list, unpair, and logout endpoints", async () => {
+    const fetchMock = vi.mocked(fetch)
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, { authRequired: true, authenticated: true }))
+      .mockResolvedValueOnce(jsonResponse(200, { status: "ok" }))
+      .mockResolvedValueOnce(jsonResponse(200, { code: "ABCD-EFGH-JKLM", expiresAt: "2026-06-24T10:00:00.000Z" }))
+      .mockResolvedValueOnce(jsonResponse(200, { devices: [{ id: "device-1", name: "This Mac", current: true }] }))
+      .mockResolvedValueOnce(jsonResponse(200, { status: "ok", current: false }))
+      .mockResolvedValueOnce(jsonResponse(200, { status: "ok" }))
+
+    await expect(getAuthState()).resolves.toMatchObject({ authenticated: true })
+    await expect(pairBrowser("ABCD-EFGH-JKLM")).resolves.toBeUndefined()
+    await expect(createPairingCode()).resolves.toMatchObject({ code: "ABCD-EFGH-JKLM" })
+    await expect(listPairedDevices()).resolves.toEqual([{ id: "device-1", name: "This Mac", current: true }])
+    await expect(unpairDevice("device-1")).resolves.toBeUndefined()
+    await expect(logoutBrowser()).resolves.toBeUndefined()
+
+    expect(fetchMock.mock.calls.map((c) => [String(c[0]), (c[1] as RequestInit | undefined)?.method])).toEqual([
+      [`${GATEWAY_ORIGIN}/api/auth/state`, "GET"],
+      [`${GATEWAY_ORIGIN}/api/auth/pair`, "POST"],
+      [`${GATEWAY_ORIGIN}/api/auth/pairing-codes`, "POST"],
+      [`${GATEWAY_ORIGIN}/api/auth/devices`, "GET"],
+      [`${GATEWAY_ORIGIN}/api/auth/devices/device-1`, "DELETE"],
+      [`${GATEWAY_ORIGIN}/api/auth/logout`, "POST"],
+    ])
+  })
+})

@@ -1,0 +1,236 @@
+/**
+ * One `oai-events` data-channel frame in, one thing the orb acts on out.
+ *
+ * The provider speaks far more events than a voice orb needs, so this narrows
+ * them to the seven the transport can do something about and drops the rest. It
+ * is the same translation the gateway's own adapter does over its WebSocket
+ * (`talk/realtime/openai.ts`), which is why the vocabulary matches: two surfaces
+ * reading one provider should not describe it differently.
+ */
+import { addTalkUsage, emptyTalkUsage, type TalkUsage } from "./usage-delta"
+
+export type RealtimeFrame =
+  | { type: "tool_call"; callId: string; name: string; arguments: string; eventId?: string; itemId?: string }
+  /** An assistant response began — the driver's, or one server-side VAD made on
+   *  its own. Until it is done, the conversation holds no room for another. */
+  | { type: "turn_started"; responseId?: string }
+  /** The assistant turn finished. `usage` is the session total after it. */
+  | { type: "turn_done"; usage: TalkUsage; responseId?: string; itemId?: string; status?: string; cancellationReason?: string }
+  | { type: "transcript"; role: "assistant" | "user"; text: string; final: boolean; eventId?: string; itemId?: string }
+  | { type: "item_created"; eventId: string; itemId: string; previousItemId?: string }
+  /** The provider's voice-activity detector heard the operator start talking. */
+  | { type: "speech_started"; itemId?: string; audioStartMs?: number }
+  | { type: "speech_stopped"; itemId?: string; audioEndMs?: number }
+  | { type: "output_started"; responseId?: string }
+  | { type: "output_stopped"; responseId?: string }
+  | { type: "output_cleared"; responseId?: string }
+  | { type: "transcript_failed"; itemId?: string }
+  | { type: "error"; message: string }
+
+interface TokenDetails {
+  audio_tokens?: number
+  text_tokens?: number
+  image_tokens?: number
+  cached_tokens_details?: { audio_tokens?: number; text_tokens?: number; image_tokens?: number }
+}
+
+function count(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+/**
+ * One response's own token counts, in the shape `POST .../turn` accepts.
+ *
+ * `response.usage` on a `response.done` event counts the response that just
+ * finished, not the session to date — which is why the reader below adds it to
+ * a running total rather than reporting it as one.
+ *
+ * Only the cached tokens the provider actually attributed to a modality are
+ * reported as cached. A cached count the provider left unsplit is left out, so
+ * those tokens bill at the full input rate — an over-report that shows up in
+ * the cost line, rather than an under-report nobody notices. Splitting them
+ * properly needs the rate table, which lives in the gateway and has no business
+ * being copied into a browser bundle.
+ */
+function readResponseUsage(raw: unknown): TalkUsage {
+  const usage = (raw ?? {}) as { input_token_details?: TokenDetails; output_token_details?: TokenDetails }
+  const input = usage.input_token_details ?? {}
+  const output = usage.output_token_details ?? {}
+  return {
+    ...emptyTalkUsage(),
+    inputAudioTokens: count(input.audio_tokens),
+    inputTextTokens: count(input.text_tokens),
+    outputAudioTokens: count(output.audio_tokens),
+    outputTextTokens: count(output.text_tokens),
+    cachedInputAudioTokens: count(input.cached_tokens_details?.audio_tokens),
+    cachedInputTextTokens: count(input.cached_tokens_details?.text_tokens),
+    inputImageTokens: count(input.image_tokens),
+    cachedInputImageTokens: count(input.cached_tokens_details?.image_tokens),
+  }
+}
+
+function errorMessage(error: unknown): string {
+  if (error && typeof error === "object" && typeof (error as { message?: unknown }).message === "string") {
+    return (error as { message: string }).message
+  }
+  return "The realtime provider reported an error with no message."
+}
+
+type FrameReader = (event: Record<string, unknown>) => RealtimeFrame | null
+
+function identity(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined
+}
+
+function timestamp(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+function responseIdentity(raw: unknown): { responseId?: string; itemId?: string } {
+  const response = raw && typeof raw === "object" ? raw as { id?: unknown; output?: unknown } : undefined
+  const output = Array.isArray(response?.output) ? response.output : []
+  const message = output.find((item) => item && typeof item === "object" && (item as { type?: unknown }).type === "message")
+  const responseId = identity(response?.id)
+  const itemId = identity((message as { id?: unknown } | undefined)?.id)
+  return { ...(responseId ? { responseId } : {}), ...(itemId ? { itemId } : {}) }
+}
+
+function responseCompletion(raw: unknown): {
+  responseId?: string
+  itemId?: string
+  status?: string
+  cancellationReason?: string
+} {
+  const response = raw as { status?: unknown; status_details?: { reason?: unknown } } | undefined
+  const status = identity(response?.status)
+  const cancellationReason = identity(response?.status_details?.reason)
+  return {
+    ...responseIdentity(raw),
+    ...(status ? { status } : {}),
+    ...(cancellationReason ? { cancellationReason } : {}),
+  }
+}
+
+/** The provider's event names, mapped to what the orb does about them. A table
+ *  rather than a switch so another event is one line and no new branch.
+ *  `response.done` is not in it: that is the one frame needing the session's
+ *  running total, which a table of pure readers has nowhere to keep. */
+const READERS: Readonly<Record<string, FrameReader>> = {
+  "response.created": (event) => ({
+    type: "turn_started",
+    ...(identity((event.response as { id?: unknown } | undefined)?.id) ? {
+      responseId: identity((event.response as { id?: unknown }).id),
+    } : {}),
+  }),
+  "response.function_call_arguments.done": (event) => ({
+    type: "tool_call",
+    callId: String(event.call_id),
+    name: String(event.name),
+    arguments: String(event.arguments ?? ""),
+    ...(identity(event.event_id) ? { eventId: identity(event.event_id) } : {}),
+    ...(identity(event.item_id) ? { itemId: identity(event.item_id) } : {}),
+  }),
+  "response.output_audio_transcript.delta": (event) => ({
+    type: "transcript",
+    role: "assistant",
+    text: String(event.delta ?? ""),
+    final: false,
+  }),
+  "response.output_audio_transcript.done": (event) => ({
+    type: "transcript",
+    role: "assistant",
+    text: String(event.transcript ?? ""),
+    final: true,
+  }),
+  "conversation.item.input_audio_transcription.completed": (event) => ({
+    type: "transcript",
+    role: "user",
+    text: String(event.transcript ?? ""),
+    final: true,
+    ...(identity(event.event_id) ? { eventId: identity(event.event_id) } : {}),
+    ...(identity(event.item_id) ? { itemId: identity(event.item_id) } : {}),
+  }),
+  "conversation.item.input_audio_transcription.failed": (event) => ({
+    type: "transcript_failed",
+    ...(identity(event.item_id) ? { itemId: identity(event.item_id) } : {}),
+  }),
+  "conversation.item.created": (event) => {
+    const item = event.item && typeof event.item === "object" ? event.item as Record<string, unknown> : null
+    const eventId = identity(event.event_id)
+    const itemId = identity(item?.id)
+    if (!eventId || !itemId) return null
+    const previousItemId = identity(event.previous_item_id)
+    return { type: "item_created", eventId, itemId, ...(previousItemId ? { previousItemId } : {}) }
+  },
+  "input_audio_buffer.speech_started": (event) => ({
+    type: "speech_started",
+    ...(identity(event.item_id) ? { itemId: identity(event.item_id) } : {}),
+    ...(timestamp(event.audio_start_ms) !== undefined ? { audioStartMs: timestamp(event.audio_start_ms) } : {}),
+  }),
+  "input_audio_buffer.speech_stopped": (event) => ({
+    type: "speech_stopped",
+    ...(identity(event.item_id) ? { itemId: identity(event.item_id) } : {}),
+    ...(timestamp(event.audio_end_ms) !== undefined ? { audioEndMs: timestamp(event.audio_end_ms) } : {}),
+  }),
+  "output_audio_buffer.cleared": (event) => ({
+    type: "output_cleared",
+    ...(identity(event.response_id) ? { responseId: identity(event.response_id) } : {}),
+  }),
+  "output_audio_buffer.started": (event) => ({
+    type: "output_started",
+    ...(identity(event.response_id) ? { responseId: identity(event.response_id) } : {}),
+  }),
+  "output_audio_buffer.stopped": (event) => ({
+    type: "output_stopped",
+    ...(identity(event.response_id) ? { responseId: identity(event.response_id) } : {}),
+  }),
+  error: (event) => ({ type: "error", message: errorMessage(event.error) }),
+}
+
+function parseEvent(data: string): Record<string, unknown> | null {
+  let event: unknown
+  try {
+    event = JSON.parse(data)
+  } catch {
+    return null
+  }
+  if (!event || typeof event !== "object" || Array.isArray(event)) return null
+  return event as Record<string, unknown>
+}
+
+/**
+ * A reader for one conversation's frames.
+ *
+ * It remembers one thing, and only because the provider makes it: `response.done`
+ * reports the counts of the response that just finished, while a `turn_done`
+ * frame carries the session total after that turn (shared/voice.ts). Adding them
+ * up here is what the gateway's adapter does over its own socket, and it is what
+ * lets the transport bill a turn by subtracting the reading before it.
+ *
+ * It returns null for a frame the transport has no use for, including one that
+ * is not JSON at all — a malformed frame must not take a live session down.
+ */
+export function createFrameReader(): (data: string) => RealtimeFrame | null {
+  let total = emptyTalkUsage()
+  return (data) => {
+    const event = parseEvent(data)
+    if (!event || typeof event.type !== "string") return null
+    if (event.type === "response.done") {
+      const response = event.response as {
+        id?: unknown
+        usage?: unknown
+        output?: unknown
+        status?: unknown
+        status_details?: { reason?: unknown }
+      } | undefined
+      total = addTalkUsage(total, readResponseUsage(response?.usage))
+      return {
+        type: "turn_done",
+        usage: total,
+        ...responseCompletion(response),
+      }
+    }
+    const read = READERS[event.type]
+    return read ? read(event) : null
+  }
+}

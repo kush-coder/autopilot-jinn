@@ -1,0 +1,109 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import type { CronJob, JinnConfig, Connector } from "../../shared/types.js";
+
+// Capture the callback node-cron would invoke on a scheduled tick so we can fire it
+// manually. cron.schedule/validate are stubbed; stopScheduler needs a `.stop()`.
+let scheduledCallback: (() => void) | undefined;
+let throwExpression: string | undefined;
+const scheduledTasks: Array<{ expression: string; start: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn> }> = [];
+vi.mock("node-cron", () => ({
+  default: {
+    schedule: vi.fn((expr: string, cb: () => void, opts?: { timezone?: string }) => {
+      if (opts?.timezone === "Mars/Olympus" || expr === throwExpression) throw new RangeError("Invalid time zone specified");
+      scheduledCallback = cb;
+      const task = { expression: expr, start: vi.fn(), stop: vi.fn() };
+      scheduledTasks.push(task);
+      return task;
+    }),
+    validate: vi.fn(() => true),
+  },
+}));
+
+// Stub the runner so we assert HOW it is invoked, not what it does.
+vi.mock("../runner.js", () => ({ runCronJob: vi.fn().mockResolvedValue(undefined) }));
+
+const job: CronJob = {
+  id: "test-job",
+  name: "Test Job",
+  enabled: true,
+  schedule: "0 * * * *",
+  prompt: "do something",
+};
+
+// findJob() loads jobs from disk — stub loadJobs to return our fixture.
+vi.mock("../jobs.js", () => ({
+  loadJobs: vi.fn(() => [job]),
+  saveJobs: vi.fn(),
+}));
+
+vi.mock("../../shared/logger.js", () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+import { reloadScheduler, startScheduler, stopScheduler, triggerCronJob } from "../scheduler.js";
+import { runCronJob } from "../runner.js";
+
+const sessionManager = {} as any;
+const baseConfig = { engines: { default: "claude" } } as unknown as JinnConfig;
+let config = baseConfig;
+const connectors = new Map<string, Connector>();
+const deps = { sessionManager, getConfig: () => config, connectors };
+
+beforeEach(() => {
+  stopScheduler();
+  vi.clearAllMocks();
+  scheduledCallback = undefined;
+  throwExpression = undefined;
+  scheduledTasks.length = 0;
+  config = baseConfig;
+});
+
+describe("scheduler — manual vs scheduled fire identity (GRS-003b-1)", () => {
+  it("triggerCronJob (manual /cron run) passes NO fireIso and reads the live config", async () => {
+    startScheduler([], deps); // capture deps, schedule nothing
+    const swapped = { engines: { default: "codex" } } as unknown as JinnConfig;
+    config = swapped;
+
+    const result = await triggerCronJob("test-job");
+
+    expect(result).toEqual(job);
+    expect(runCronJob).toHaveBeenCalledTimes(1);
+    const call = (runCronJob as any).mock.calls[0];
+    // PLA-260: the config reaching the runner is the one the gateway holds NOW,
+    // not the one that existed when the scheduler was started.
+    expect(call[2]).toBe(swapped);
+    // The opts carry the workflow fire handler slot (GRS-014d) but NO fireIso — a manual
+    // trigger is a fresh fire by definition, so it never reuses a scheduled tick's identity.
+    expect(call[4]?.fireIso).toBeUndefined();
+  });
+
+  it("a scheduled tick passes a deterministic per-fire fireIso and reads the live config", () => {
+    startScheduler([job], deps); // schedules the job, captures cb
+    expect(scheduledCallback).toBeTypeOf("function");
+    const swapped = { engines: { default: "codex" } } as unknown as JinnConfig;
+    config = swapped;
+
+    scheduledCallback!(); // simulate node-cron firing the tick
+
+    expect(runCronJob).toHaveBeenCalledTimes(1);
+    const call = (runCronJob as any).mock.calls[0];
+    expect(call[2]).toBe(swapped); // PLA-260: resolved at fire time, not capture time
+    const opts = call[4];
+    expect(opts).toBeDefined();
+    expect(opts.fireIso).toMatch(/^\d{4}-\d{2}-\d{2}T[0-9:.]+Z$/);
+  });
+
+  it("reload skips an invalid job and schedules the valid ones", () => {
+    startScheduler([job], deps);
+    const oldTask = scheduledTasks[0];
+    throwExpression = "5 * * * *";
+    const invalid = { ...job, id: "bad", schedule: throwExpression };
+    const valid = { ...job, id: "replacement" };
+
+    expect(reloadScheduler([invalid, valid])).toEqual({ scheduled: 1, skipped: 1 });
+
+    expect(oldTask.stop).toHaveBeenCalled();
+    expect(scheduledTasks).toHaveLength(2); // boot task + valid replacement
+  });
+
+});

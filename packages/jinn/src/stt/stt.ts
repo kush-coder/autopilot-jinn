@@ -1,0 +1,252 @@
+import fs from "node:fs";
+import path from "node:path";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
+import { LEGACY_STT_MODELS_DIR, STT_MODELS_DIR, STT_SETTINGS_FILE } from "../shared/paths.js";
+import { logger } from "../shared/logger.js";
+import { adoptLegacyModels, findModelFile } from "./model-store.js";
+import {
+  readSharedSttSettings,
+  seedSharedSttSettings,
+  type LocalSttSettings,
+} from "./settings-store.js";
+
+const execFileAsync = promisify(execFile);
+
+const WHISPER_CLI = "whisper-cli";
+const FFMPEG = "ffmpeg";
+
+/** Valid Whisper language codes (ISO 639-1). */
+export const WHISPER_LANGUAGES: Record<string, string> = {
+  en: "English", bg: "Bulgarian", de: "German", fr: "French", es: "Spanish",
+  it: "Italian", pt: "Portuguese", ru: "Russian", zh: "Chinese", ja: "Japanese",
+  ko: "Korean", ar: "Arabic", hi: "Hindi", tr: "Turkish", pl: "Polish",
+  nl: "Dutch", sv: "Swedish", cs: "Czech", el: "Greek", ro: "Romanian",
+  uk: "Ukrainian", he: "Hebrew", da: "Danish", fi: "Finnish", hu: "Hungarian",
+  no: "Norwegian", sk: "Slovak", hr: "Croatian", ca: "Catalan", th: "Thai",
+  vi: "Vietnamese", id: "Indonesian", ms: "Malay", tl: "Filipino", sr: "Serbian",
+  lt: "Lithuanian", lv: "Latvian", sl: "Slovenian", et: "Estonian",
+};
+
+const MODEL_URLS: Record<string, string> = {
+  tiny: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
+  "tiny.en": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
+  base: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+  "base.en": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+  small: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+  "small.en": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
+  medium: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
+  "medium.en": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin",
+  "large-v3-turbo": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+};
+
+const MODEL_FILES: Record<string, string> = Object.fromEntries(
+  Object.entries(MODEL_URLS).map(([k, url]) => [k, path.basename(url)]),
+);
+
+const EXPECTED_SIZES: Record<string, number> = {
+  tiny: 75_000_000,
+  "tiny.en": 75_000_000,
+  base: 142_000_000,
+  "base.en": 142_000_000,
+  small: 466_000_000,
+  "small.en": 466_000_000,
+  medium: 1_500_000_000,
+  "medium.en": 1_500_000_000,
+  "large-v3-turbo": 1_500_000_000,
+};
+
+let downloading = false;
+let downloadProgress = 0;
+
+/** Initialize host-shared STT models and settings. */
+export function initStt(localSettings?: LocalSttSettings): void {
+  fs.mkdirSync(STT_MODELS_DIR, { recursive: true });
+  try {
+    const adopted = adoptLegacyModels({
+      sharedDir: STT_MODELS_DIR,
+      legacyDir: LEGACY_STT_MODELS_DIR,
+      filenames: Object.values(MODEL_FILES),
+    });
+    if (adopted.length > 0) logger.info(`Adopted ${adopted.length} legacy STT model(s) into ${STT_MODELS_DIR}`);
+  } catch (error) {
+    logger.warn(`Could not adopt legacy STT models: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    seedSharedSttSettings(STT_SETTINGS_FILE, localSettings);
+    readSharedSttSettings(STT_SETTINGS_FILE, logger.warn);
+  } catch (error) {
+    logger.warn(`Could not seed shared STT settings: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  logger.info(`STT initialized, models dir: ${STT_MODELS_DIR}`);
+}
+
+export function getModelPath(model: string): string | null {
+  const filename = MODEL_FILES[model];
+  if (!filename) return null;
+  return findModelFile(filename, [STT_MODELS_DIR, LEGACY_STT_MODELS_DIR]);
+}
+
+export interface SttStatus {
+  available: boolean;
+  model: string | null;
+  downloading: boolean;
+  progress: number;
+  languages: string[];
+}
+
+export function getSttStatus(model: string, languages: string[]): SttStatus {
+  const modelPath = getModelPath(model);
+  return {
+    available: modelPath !== null,
+    model: modelPath ? model : null,
+    downloading,
+    progress: downloadProgress,
+    languages,
+  };
+}
+
+export async function downloadModel(
+  model: string,
+  onProgress: (progress: number) => void,
+): Promise<void> {
+  if (downloading) throw new Error("Download already in progress");
+
+  const url = MODEL_URLS[model];
+  if (!url) throw new Error(`Unknown model: ${model}`);
+
+  if (getModelPath(model)) {
+    onProgress(100);
+    return;
+  }
+
+  downloading = true;
+  downloadProgress = 0;
+
+  const filename = MODEL_FILES[model]!;
+  const destPath = path.join(STT_MODELS_DIR, filename);
+  const tmpPath = `${destPath}.downloading.${process.pid}`;
+  const expectedSize = EXPECTED_SIZES[model] || 466_000_000;
+
+  try {
+    fs.mkdirSync(STT_MODELS_DIR, { recursive: true });
+
+    await new Promise<void>((resolve, reject) => {
+      // Use curl for download — handles redirects, progress, and is reliable
+      const curl = spawn("curl", [
+        "-L", // follow redirects
+        "-o", tmpPath,
+        url,
+      ]);
+
+      // Poll file size for progress
+      const progressInterval = setInterval(() => {
+        try {
+          const stat = fs.statSync(tmpPath, { throwIfNoEntry: false } as fs.StatSyncOptions & { throwIfNoEntry: false });
+          if (stat && stat.size > 0) {
+            downloadProgress = Math.min(95, Math.round(((stat.size as number) / expectedSize) * 100));
+            onProgress(downloadProgress);
+          }
+        } catch { /* file not created yet */ }
+      }, 1000);
+
+      curl.on("close", (code) => {
+        clearInterval(progressInterval);
+        if (code === 0) resolve();
+        else reject(new Error(`curl exited with code ${code}`));
+      });
+
+      curl.on("error", (err) => {
+        clearInterval(progressInterval);
+        reject(err);
+      });
+    });
+
+    // Integrity sanity check before renaming into place: exact sizes drift
+    // upstream, so accept anything >= 90% of the expected size, but reject a
+    // truncated/empty download hard — a bad rename here would poison
+    // getModelPath() into reporting the model as available forever.
+    const actualSize = fs.statSync(tmpPath, { throwIfNoEntry: false } as fs.StatSyncOptions & { throwIfNoEntry: false })?.size ?? 0;
+    if (actualSize < expectedSize * 0.9) {
+      throw new Error(
+        `Downloaded model '${model}' looks truncated (${actualSize} bytes, expected ~${expectedSize}) — deleted; try again`,
+      );
+    }
+
+    // Rename temp file to final path
+    fs.renameSync(tmpPath, destPath);
+
+    downloadProgress = 100;
+    onProgress(100);
+    logger.info(`STT model '${model}' downloaded to ${destPath}`);
+  } catch (err) {
+    // Clean up partial download
+    try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    throw err;
+  } finally {
+    downloading = false;
+  }
+}
+
+/**
+ * Convert audio to WAV (16kHz mono PCM) using ffmpeg.
+ * whisper-cli requires this format.
+ */
+async function convertToWav(inputPath: string): Promise<string> {
+  const wavPath = inputPath.replace(/\.[^.]+$/, "") + ".wav";
+  await execFileAsync(FFMPEG, [
+    "-i", inputPath,
+    "-ar", "16000",    // 16kHz sample rate
+    "-ac", "1",        // mono
+    "-c:a", "pcm_s16le", // 16-bit PCM
+    "-y",              // overwrite
+    wavPath,
+  ], {
+    timeout: 2 * 60 * 1000, // 2 min timeout
+  });
+  return wavPath;
+}
+
+export async function transcribe(
+  audioPath: string,
+  model: string,
+  language?: string,
+): Promise<string> {
+  const modelPath = getModelPath(model);
+  if (!modelPath)
+    throw new Error(`Model '${model}' not found. Download it first.`);
+
+  // Convert to WAV if not already
+  let wavPath = audioPath;
+  let needsCleanup = false;
+  if (!audioPath.endsWith(".wav")) {
+    wavPath = await convertToWav(audioPath);
+    needsCleanup = true;
+  }
+
+  try {
+    const { stdout } = await execFileAsync(WHISPER_CLI, [
+      "-m", modelPath,
+      "-l", language || "en",
+      "--no-timestamps",
+      "-f", wavPath,
+    ], {
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 15 * 60 * 1000, // 15 min timeout for long recordings
+    });
+
+    // Clean up whisper output: remove blank lines, trim whitespace
+    const text = stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0)
+      .join(" ")
+      .trim();
+
+    return text;
+  } finally {
+    if (needsCleanup) {
+      try { fs.unlinkSync(wavPath); } catch { /* ignore */ }
+    }
+  }
+}

@@ -1,0 +1,34 @@
+node_modules/
+dist/
+.next/
+.turbo/
+coverage/
+test-results/
+*.tsbuildinfo
+.env
+.env.local
+# npm publish token (jinn-cli) — local only, never commit
+packages/jinn/.npmrc
+.worktrees/
+.DS_Store
+
+# Superpowers SDD scratch (briefs, reports, ledger, diffs)
+.superpowers/
+
+# Hermes engine local scratch (session plans) — runtime residue, never product code
+.hermes/
+# Local sprint/evidence sandboxes and captured runtime artifacts — never commit
+.jinn-*-sprint/
+# Per-run build evidence (deliverable-evidence.mjs). It names files in the
+# operator's workspace, so it belongs to the worktree and the Todo, never here.
+.jinn-build/
+# Local one-off recording/capture harnesses (contain personal paths) — never commit
+.tmp-*
+
+# Terms the footgun checker treats as private — real names, clients, products.
+# Committing that list would publish exactly what the privacy rule exists to keep out.
+scripts/.footgun-terms.local
+
+# Docker Compose local overrides — personal host paths, merged automatically.
+# The tracked docker-compose.yml carries the inline mount examples.
+docker-compose.override.yml

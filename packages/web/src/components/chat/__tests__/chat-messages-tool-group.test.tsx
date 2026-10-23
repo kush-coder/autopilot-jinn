@@ -1,0 +1,527 @@
+import { describe, expect, it } from 'vitest'
+import { fireEvent, render, screen, within } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
+import { FileText, Globe, Search, Terminal, Wrench } from 'lucide-react'
+import { ChatMessages, toolGlyphForName } from '../chat-messages'
+import type { Message } from '@/lib/conversations'
+
+/** Activity blocks render CompanyActivityCard, which reads useNavigate — those
+ *  cases render inside a router (the real chat page always is). */
+function renderRouted(messages: Message[], loading = false) {
+  return render(
+    <MemoryRouter>
+      <ChatMessages messages={messages} loading={loading} />
+    </MemoryRouter>,
+  )
+}
+
+describe('ChatMessages tool groups', () => {
+  it.each([
+    ['Read', FileText],
+    ['SHELL_COMMAND', Terminal],
+    ['find_matches', Search],
+    ['WebFetch', Globe],
+    ['unknown_tool', Wrench],
+    ['mcp__jinn__FILE_EDIT', FileText],
+  ])('maps %s to its tool-kind glyph', (toolName, expectedGlyph) => {
+    expect(toolGlyphForName(toolName)).toBe(expectedGlyph)
+  })
+
+  it('renders unsafe markdown links as plain text', () => {
+    const messages: Message[] = [{
+      id: 'm1',
+      role: 'assistant',
+      content: 'Open [bad](javascript:alert(1)) and [good](https://example.com).',
+      timestamp: 100,
+    }]
+
+    render(<ChatMessages messages={messages} loading={false} />)
+
+    expect(screen.getByText(/bad/)).toBeTruthy()
+    expect(screen.queryByRole('link', { name: 'bad' })).toBeNull()
+    expect(screen.getByRole('link', { name: 'good' }).getAttribute('href')).toBe('https://example.com')
+  })
+
+  it('keeps expanded tool rows compact and does not render block details', () => {
+    const messages: Message[] = [
+      {
+        id: 'tool-edit',
+        role: 'assistant',
+        content: 'Used file_edit',
+        timestamp: 100,
+        toolCall: 'file_edit',
+        blocks: [{
+          id: 'plan-1',
+          type: 'task-list',
+          version: 1,
+          title: 'Plan',
+          payload: { items: [{ id: 'a', text: 'Hidden task detail', status: 'running' }] },
+        }],
+      },
+      {
+        id: 'tool-read',
+        role: 'assistant',
+        content: 'Used file_read',
+        timestamp: 101,
+        toolCall: 'file_read',
+      },
+      {
+        id: 'answer',
+        role: 'assistant',
+        content: 'Done.',
+        timestamp: 102,
+      },
+    ]
+
+    render(<ChatMessages messages={messages} loading={false} />)
+
+    // The turn has its final answer, so the evidence rests folded behind the
+    // work summary — expand it first.
+    fireEvent.click(screen.getByRole('button', { name: /show the work/i }))
+
+    const groupButton = screen.getByRole('button', { name: /^2 tools$/i })
+    expect(groupButton.textContent).not.toMatch(/patch|detail/i)
+    expect(screen.queryByText('Hidden task detail')).toBeNull()
+
+    fireEvent.click(groupButton)
+    const group = screen.getByTestId('tool-group-list')
+    expect(within(group).getByText('file_edit')).toBeTruthy()
+    expect(within(group).getByText('file_read')).toBeTruthy()
+    expect(within(group).queryByText('Hidden task detail')).toBeNull()
+    expect(within(group).queryByRole('button', { name: /file_edit/i })).toBeNull()
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.getByText('Done.')).toBeTruthy()
+  })
+
+  it('only marks the latest unfinished active tool as running', () => {
+    const messages: Message[] = [
+      {
+        id: 'tool-1',
+        role: 'assistant',
+        content: 'Using inspect_repo',
+        timestamp: 100,
+        toolCall: 'inspect_repo',
+      },
+      {
+        id: 'tool-2',
+        role: 'assistant',
+        content: 'Using read_component',
+        timestamp: 101,
+        toolCall: 'read_component',
+      },
+      {
+        id: 'tool-3',
+        role: 'assistant',
+        content: 'Using run_tests',
+        timestamp: 102,
+        toolCall: 'run_tests',
+      },
+    ]
+
+    render(<ChatMessages messages={messages} loading />)
+
+    fireEvent.click(screen.getByRole('button', { name: /3 tools running/i }))
+    const group = screen.getByTestId('tool-group-list')
+
+    expect(within(group).getAllByLabelText('Running')).toHaveLength(1)
+    expect(within(group).getByText('run_tests').closest('div')?.textContent).toContain('run_tests')
+  })
+
+  it('keeps the current done, queued, and running status marks', () => {
+    const messages: Message[] = [
+      {
+        id: 'tool-done',
+        role: 'assistant',
+        content: 'Used file_read',
+        timestamp: 100,
+        toolCall: 'file_read',
+      },
+      {
+        id: 'tool-queued',
+        role: 'assistant',
+        content: 'Using inspect_repo',
+        timestamp: 101,
+        toolCall: 'inspect_repo',
+      },
+      {
+        id: 'tool-running',
+        role: 'assistant',
+        content: 'Using run_tests',
+        timestamp: 102,
+        toolCall: 'run_tests',
+      },
+    ]
+
+    render(<ChatMessages messages={messages} loading />)
+
+    fireEvent.click(screen.getByRole('button', { name: /3 tools running/i }))
+    const group = screen.getByTestId('tool-group-list')
+    const doneRow = within(group).getByText('file_read').closest('div')
+    const queuedRow = within(group).getByText('inspect_repo').closest('div')
+    const runningRow = within(group).getByText('run_tests').closest('div')
+
+    expect(doneRow?.querySelector('.lucide-check')).not.toBeNull()
+    expect(queuedRow?.querySelector('.lucide-circle')).not.toBeNull()
+    expect(runningRow?.querySelector('.lucide-loader-circle')).not.toBeNull()
+    expect(within(group).getAllByLabelText('Running')).toHaveLength(1)
+  })
+
+  it('keeps a tool group active when a live block follows it', () => {
+    const messages: Message[] = [
+      {
+        id: 'tool-1',
+        role: 'assistant',
+        content: 'Using file_edit',
+        timestamp: 100,
+        toolCall: 'file_edit',
+      },
+      {
+        id: 'plan',
+        role: 'assistant',
+        content: 'Plan',
+        timestamp: 101,
+        blocks: [{
+          id: 'plan',
+          type: 'task-list',
+          version: 1,
+          payload: { items: [{ id: 'a', text: 'Edit file', status: 'running' }] },
+        }],
+      },
+    ]
+
+    render(<ChatMessages messages={messages} loading />)
+
+    fireEvent.click(screen.getByRole('button', { name: /1 tool running/i }))
+    expect(within(screen.getByTestId('tool-group-list')).getAllByLabelText('Running')).toHaveLength(1)
+  })
+
+  it('keeps a hidden active tool visible in long running groups', () => {
+    const messages: Message[] = Array.from({ length: 12 }, (_, index) => ({
+      id: `tool-${index + 1}`,
+      role: 'assistant' as const,
+      content: index === 11 ? 'Using tool_12' : `Used tool_${index + 1}`,
+      timestamp: 100 + index,
+      toolCall: `tool_${index + 1}`,
+    }))
+
+    render(<ChatMessages messages={messages} loading />)
+
+    fireEvent.click(screen.getByRole('button', { name: /12 tools running/i }))
+    const group = screen.getByTestId('tool-group-list')
+
+    expect(within(group).getByText('tool_12')).toBeTruthy()
+    expect(within(group).getAllByLabelText('Running')).toHaveLength(1)
+    expect(within(group).getByRole('button', { name: /show 2 more/i })).toBeTruthy()
+  })
+
+  it('caps long tool groups behind a compact more button', () => {
+    const messages: Message[] = Array.from({ length: 12 }, (_, index) => ({
+      id: `tool-${index + 1}`,
+      role: 'assistant' as const,
+      content: `Used tool_${index + 1}`,
+      timestamp: 100 + index,
+      toolCall: `tool_${index + 1}`,
+    }))
+
+    render(<ChatMessages messages={messages} loading={false} />)
+
+    const groupButton = screen.getByRole('button', { name: /12 tools/i })
+    expect(groupButton.textContent).not.toContain('tool_1')
+    expect(groupButton.textContent).not.toContain('tool_2')
+
+    fireEvent.click(groupButton)
+    const group = screen.getByTestId('tool-group-list')
+
+    expect(within(group).getByText('tool_1')).toBeTruthy()
+    expect(within(group).getByText('tool_10')).toBeTruthy()
+    expect(within(group).queryByText('tool_11')).toBeNull()
+    expect(within(group).getByRole('button', { name: /show 2 more/i })).toBeTruthy()
+
+    fireEvent.click(within(group).getByRole('button', { name: /show 2 more/i }))
+    expect(within(group).getByText('tool_11')).toBeTruthy()
+    expect(within(group).getByText('tool_12')).toBeTruthy()
+    expect(within(group).queryByRole('button', { name: /show 2 more/i })).toBeNull()
+  })
+
+  it('filters delegate_task from the generic tool pill', () => {
+    const messages: Message[] = [
+      {
+        id: 'delegate',
+        role: 'assistant',
+        content: 'Used delegate_task',
+        timestamp: 100,
+        toolCall: 'delegate_task',
+      },
+      {
+        id: 'read',
+        role: 'assistant',
+        content: 'Used read_session',
+        timestamp: 101,
+        toolCall: 'read_session',
+      },
+      {
+        id: 'handoff',
+        role: 'assistant',
+        content: 'Handed off',
+        timestamp: 102,
+        blocks: [{
+          id: 'dg-1',
+          type: 'delegation',
+          version: 1,
+          status: 'running',
+          payload: {
+            employee: 'researcher',
+            employeeDisplay: 'Researcher',
+            title: 'Research the issue',
+            childSessionId: 'child-1',
+            workItemId: 'wi-1',
+            dispatchedAt: 100,
+          },
+        }],
+      },
+    ]
+
+    render(<ChatMessages messages={messages} loading={false} />)
+
+    expect(screen.getByRole('button', { name: /^1 tool$/i })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /^1 tool$/i }))
+    expect(screen.queryByText('delegate_task')).toBeNull()
+    expect(screen.getByText('read_session')).toBeTruthy()
+  })
+
+  it('keeps legacy delegate_task rows when no handoff card exists', () => {
+    const messages: Message[] = [{
+      id: 'delegate',
+      role: 'assistant',
+      content: 'Used delegate_task',
+      timestamp: 100,
+      toolCall: 'delegate_task',
+    }]
+
+    render(<ChatMessages messages={messages} loading={false} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /^1 tool$/i }))
+    expect(screen.getByText('delegate_task')).toBeTruthy()
+  })
+
+  it('suppresses a correlated successful tool row when its activity block is present', () => {
+    const messages: Message[] = [
+      {
+        id: 'tool-update',
+        role: 'assistant',
+        content: 'Used update_work_item',
+        timestamp: 100,
+        toolCall: 'update_work_item',
+        meta: { activityReceiptId: 'todo:wi_release' },
+      },
+      {
+        id: 'block-msg',
+        role: 'assistant',
+        content: 'Todo “Prepare release” · in review',
+        timestamp: 101,
+        blocks: [{
+          id: 'todo:wi_release',
+          type: 'todo-activity',
+          version: 1,
+          status: 'waiting',
+          title: 'Prepare release',
+          payload: { todoId: 'wi_release', action: 'transitioned', status: 'in_review' },
+        }],
+      },
+    ]
+
+    renderRouted(messages)
+
+    // The activity object renders as its card…
+    expect(screen.getByText('Prepare release')).toBeTruthy()
+    // …and its redundant generic tool row is gone (no tool pill at all).
+    expect(screen.queryByRole('button', { name: /tool/i })).toBeNull()
+    expect(screen.queryByText('update_work_item')).toBeNull()
+  })
+
+  it('keeps an error tool row without a receipt, and a not-yet-present block does not suppress', () => {
+    const messages: Message[] = [
+      {
+        id: 'tool-ok',
+        role: 'assistant',
+        content: 'Used update_work_item',
+        timestamp: 100,
+        toolCall: 'update_work_item',
+        meta: { activityReceiptId: 'todo:wi_missing' }, // block not present yet
+      },
+      {
+        id: 'tool-err',
+        role: 'assistant',
+        content: 'Used create_work_item',
+        timestamp: 101,
+        toolCall: 'create_work_item', // error/read-only row, no receipt
+      },
+    ]
+
+    render(<ChatMessages messages={messages} loading={false} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /^2 tools$/i }))
+    expect(screen.getByText('update_work_item')).toBeTruthy()
+    expect(screen.getByText('create_work_item')).toBeTruthy()
+  })
+
+  it('does not suppress two uncorrelated same-name tool rows sharing one block', () => {
+    const messages: Message[] = [
+      {
+        id: 'tool-a',
+        role: 'assistant',
+        content: 'Used update_work_item',
+        timestamp: 100,
+        toolCall: 'update_work_item',
+      },
+      {
+        id: 'tool-b',
+        role: 'assistant',
+        content: 'Used update_work_item',
+        timestamp: 101,
+        toolCall: 'update_work_item',
+      },
+      {
+        id: 'block-msg',
+        role: 'assistant',
+        content: 'Todo “Prepare release” · in review',
+        timestamp: 102,
+        blocks: [{
+          id: 'todo:wi_amb',
+          type: 'todo-activity',
+          version: 1,
+          status: 'waiting',
+          title: 'Prepare release',
+          payload: {
+            todoId: 'wi_amb',
+            action: 'transitioned',
+            status: 'in_review',
+            activityReceipt: { id: 'todo:wi_amb', operationId: 'op-1', toolName: 'update_work_item' },
+          },
+        }],
+      },
+    ]
+
+    renderRouted(messages)
+
+    fireEvent.click(screen.getByRole('button', { name: /^2 tools$/i }))
+    const group = screen.getByTestId('tool-group-list')
+    expect(within(group).getAllByText('update_work_item')).toHaveLength(2)
+  })
+
+  it('suppresses one legacy row by strict 1:1 toolName match within a turn', () => {
+    const messages: Message[] = [
+      { id: 'u1', role: 'user', content: 'update the todo', timestamp: 90 },
+      {
+        id: 'tool-legacy',
+        role: 'assistant',
+        content: 'Used update_work_item',
+        timestamp: 100,
+        toolCall: 'update_work_item', // no meta.activityReceiptId (pre-correlation reload)
+      },
+      {
+        id: 'block-msg',
+        role: 'assistant',
+        content: 'Todo “Prepare release” · in review',
+        timestamp: 101,
+        blocks: [{
+          id: 'todo:wi_legacy',
+          type: 'todo-activity',
+          version: 1,
+          status: 'waiting',
+          title: 'Prepare release',
+          payload: {
+            todoId: 'wi_legacy',
+            action: 'transitioned',
+            status: 'in_review',
+            activityReceipt: { id: 'todo:wi_legacy', operationId: 'op-9', toolName: 'update_work_item' },
+          },
+        }],
+      },
+    ]
+
+    renderRouted(messages)
+
+    expect(screen.getByText('Prepare release')).toBeTruthy()
+    expect(screen.queryByText('update_work_item')).toBeNull()
+  })
+
+  it('presents a burst of same-root Todo creation receipts as one hierarchy collection', () => {
+    const messages: Message[] = [
+      {
+        id: 'root',
+        role: 'assistant',
+        content: 'Todo “Prepare release” · assigned',
+        timestamp: 100,
+        blocks: [{
+          id: 'todo:JIN-1',
+          type: 'todo-activity',
+          version: 1,
+          status: 'queued',
+          title: 'Prepare release',
+          payload: {
+            todoId: 'JIN-1',
+            action: 'created',
+            status: 'assigned',
+            parentId: null,
+            rootId: 'JIN-1',
+            depth: 0,
+          },
+        }],
+      },
+      {
+        id: 'child-1',
+        role: 'assistant',
+        content: 'Todo “Build artifacts” · assigned',
+        timestamp: 101,
+        blocks: [{
+          id: 'todo:JIN-2',
+          type: 'todo-activity',
+          version: 1,
+          status: 'queued',
+          title: 'Build artifacts',
+          payload: {
+            todoId: 'JIN-2',
+            action: 'created',
+            status: 'assigned',
+            parentId: 'JIN-1',
+            rootId: 'JIN-1',
+            depth: 1,
+          },
+        }],
+      },
+      {
+        id: 'child-2',
+        role: 'assistant',
+        content: 'Todo “Verify artifacts” · assigned',
+        timestamp: 102,
+        blocks: [{
+          id: 'todo:JIN-3',
+          type: 'todo-activity',
+          version: 1,
+          status: 'queued',
+          title: 'Verify artifacts',
+          payload: {
+            todoId: 'JIN-3',
+            action: 'created',
+            status: 'assigned',
+            parentId: 'JIN-1',
+            rootId: 'JIN-1',
+            depth: 1,
+          },
+        }],
+      },
+    ]
+
+    renderRouted(messages)
+
+    const collection = screen.getByTestId('todo-activity-burst')
+    expect(within(collection).getByText('Prepare release')).toBeTruthy()
+    expect(within(collection).getByText('Build artifacts')).toBeTruthy()
+    expect(within(collection).getByText('Verify artifacts')).toBeTruthy()
+    expect(within(collection).getByText('2 sub-tasks')).toBeTruthy()
+    expect(within(collection).getByText('Todo · JIN-1')).toBeTruthy()
+    expect(screen.queryByText('Todo · JIN-2')).toBeNull()
+    expect(screen.queryByText('Todo · JIN-3')).toBeNull()
+  })
+})
